@@ -1,4 +1,5 @@
 hnswlib.egg-info/
+GraphHierarchy.egg-info/
 build/
 dist/
 tmp/

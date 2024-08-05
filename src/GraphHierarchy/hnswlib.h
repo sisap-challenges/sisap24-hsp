@@ -186,39 +186,15 @@ class SpaceInterface {
 template<typename dist_t>
 class AlgorithmInterface {
  public:
-    virtual void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) = 0;
+    virtual void addPoint(const void *datapoint, labeltype label) = 0;
 
-    virtual std::priority_queue<std::pair<dist_t, labeltype>>
-        searchKnn(const void*, size_t, BaseFilterFunctor* isIdAllowed = nullptr) const = 0;
+    // virtual std::priority_queue<std::pair<dist_t, labeltype>>
+    //     search(const void*, size_t) const = 0;
 
-    // Return k nearest neighbor in the order of closer fist
-    virtual std::vector<std::pair<dist_t, labeltype>>
-        searchKnnCloserFirst(const void* query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const;
-
-    virtual void saveIndex(const std::string &location) = 0;
+    // virtual void saveIndex(const std::string &location) = 0;
     virtual ~AlgorithmInterface(){
     }
 };
-
-template<typename dist_t>
-std::vector<std::pair<dist_t, labeltype>>
-AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void* query_data, size_t k,
-                                                 BaseFilterFunctor* isIdAllowed) const {
-    std::vector<std::pair<dist_t, labeltype>> result;
-
-    // here searchKnn returns the result in the order of further first
-    auto ret = searchKnn(query_data, k, isIdAllowed);
-    {
-        size_t sz = ret.size();
-        result.resize(sz);
-        while (!ret.empty()) {
-            result[--sz] = ret.top();
-            ret.pop();
-        }
-    }
-
-    return result;
-}
 }  // namespace hnswlib
 
 #include "space_l2.h"
