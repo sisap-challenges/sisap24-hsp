@@ -46,15 +46,15 @@ jobs:
           conda activate hsp
           conda install matplotlib
           pip install h5py
-          cd hnswlib/
+          cd src/
           pip install .
       - name: Run benchmark
         shell: bash -el {0}
         run: |
           conda activate hsp
           python3 search/search.py
-          python3 eval/eval.py
-          python3 eval/plot.py res.csv --size 300K
+          python3 eval-2023/eval.py
+          python3 eval-2023/plot.py res.csv --size 300K
       - uses: actions/upload-artifact@v3
         with:
           name: Results on 300k
