@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.request import urlretrieve
 import time
 
-data_directory = "/users/cfoste18/scratch/datasets/LAION"
+data_directory = "data"
 
 def download(src, dst):
     if not os.path.exists(dst):
