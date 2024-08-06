@@ -29,15 +29,19 @@ struct Level {
         num_pivots_++;
         pivots_.push_back(pivot);
         map_[pivot] = idx;
-        partitions_.push_back(std::vector<tableint>{});
-        graph_.push_back(std::vector<tableint>{});
+    }
+    void initialize_partitions() {
+        partitions_.resize(num_pivots_);
+    }
+    void initialize_graph() {
+        graph_.resize(num_pivots_);
     }
     void set_neighbors(tableint const pivot, std::vector<tableint> const &neighbors) {
         graph_[map_[pivot]] = neighbors;
     }
     void add_member(tableint const pivot, tableint const member) { partitions_[map_[pivot]].push_back(member); }
-    std::vector<tableint> const &get_neighbors(tableint pivot) { return graph_[map_.at(pivot)]; }
-    std::vector<tableint> const &get_partition(tableint pivot) { return partitions_[map_.at(pivot)]; }
+    std::vector<tableint> const &get_neighbors(tableint pivot) const { return graph_[map_.at(pivot)]; }
+    std::vector<tableint> const &get_partition(tableint pivot) const { return partitions_[map_.at(pivot)]; }
 };
 
 template <typename dist_t>
@@ -110,13 +114,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
      * ====================================================================================================
      */
 
-    HierarchicalNSW(SpaceInterface<dist_t> *s, const std::string &location, size_t max_elements = 0) {
-        loadIndex(location, s, max_elements);
+    HierarchicalNSW(SpaceInterface<dist_t> *s, const std::string &location, size_t random_seed = 100) {
+        level_generator_.seed(random_seed);
+        update_probability_generator_.seed(random_seed + 1);
+        loadIndex(location, s);
     }
 
-    HierarchicalNSW(SpaceInterface<dist_t> *s, size_t max_elements, size_t scaling = 10, size_t max_neighbors = 64,
-                    size_t random_seed = 100)
+    HierarchicalNSW(SpaceInterface<dist_t> *s, size_t max_elements, size_t max_neighbors = 64, size_t random_seed = 100)
         : label_op_locks_(MAX_LABEL_OPERATION_LOCKS), link_list_locks_(max_elements) {
+
         // initializing hierarchy
         max_elements_ = max_elements;
         dataset_size_ = max_elements;
@@ -125,20 +131,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         data_size_ = s->get_data_size();
         dist_func_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
-
-        // initialize the hierarchy
-        scaling_ = scaling;
-        mult_ = 1 / log(1.0 * scaling_);
-        num_levels_ = 0;
-        double start_value = (double)dataset_size_;
-        while (start_value >= 10) {
-            num_levels_++;
-            start_value /= (double)scaling;
-        }
-        hierarchy_.resize(num_levels_ - 1);  // not bottom level!
-        printf("Total number of levels: %d\n", num_levels_);
-
-        // reserve space for all those data structures
 
         // approximate hsp parameters
         max_neighbors_ = max_neighbors;
@@ -186,118 +178,51 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::ofstream output(location, std::ios::binary);
         std::streampos position;
 
-        // basic data parameters
-        writeBinaryPOD(output, offsetLevel0_);
+        // write the few parameters
         writeBinaryPOD(output, max_elements_);
         writeBinaryPOD(output, cur_element_count);
-        writeBinaryPOD(output, size_data_per_element_);
-        writeBinaryPOD(output, label_offset_);
-        writeBinaryPOD(output, offsetData_);
-
-        // hierarchy parameters
-        writeBinaryPOD(output, dataset_size_);
-        writeBinaryPOD(output, num_levels_);
-        writeBinaryPOD(output, scaling_);
-        writeBinaryPOD(output, mult_);
         writeBinaryPOD(output, max_neighbors_);
-        writeBinaryPOD(output, ahsp_num_partitions_);
-        writeBinaryPOD(output, ahsp_beam_size_);
-        writeBinaryPOD(output, ahsp_max_region_size_);
 
-        // search parameters
-        writeBinaryPOD(output, beam_size_);
-        writeBinaryPOD(output, max_neighbors_to_check_);
-
-        // save the bottom level memory
+        // write the bottom layer graph and datapoints
         output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
 
-        // save the top level information
-        for (int ell = 0; ell < num_levels_ - 1; ell++) {
-            unsigned int num_pivots = hierarchy_[ell].num_pivots_;
-            writeBinaryPOD(output, num_pivots);
-
-            // the pivots on each level
-            output.write((char *)hierarchy_[ell].pivots_.data(), num_pivots * sizeof(tableint));
-
-            // the partitions on each level
-            for (size_t itp = 0; itp < num_pivots; itp++) {
-                unsigned int num_members = (unsigned int)hierarchy_[ell].partitions_[itp].size();
-                writeBinaryPOD(output, num_members);
-
-                // the pivots on each level
-                output.write((char *)hierarchy_[ell].partitions_[itp].data(), num_members * sizeof(tableint));
-            }
-        }
+        // that's it!
         output.close();
         return;
     }
 
-    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
+    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s) {
         printf("Loading dataset from: %s\n", location.c_str());
         std::ifstream input(location, std::ios::binary);
         if (!input.is_open()) throw std::runtime_error("Cannot open file");
         clear();
 
-        // get file size:
-        input.seekg(0, input.end);
-        std::streampos total_filesize = input.tellg();
-        input.seekg(0, input.beg);
-
-        readBinaryPOD(input, offsetLevel0_);
+        // read the important parameters
         readBinaryPOD(input, max_elements_);
         readBinaryPOD(input, cur_element_count);
-        size_t max_elements = max_elements_i;
-        if (max_elements < cur_element_count) max_elements = max_elements_;
-        max_elements_ = max_elements;
-
-        readBinaryPOD(input, size_data_per_element_);
-        readBinaryPOD(input, label_offset_);
-        readBinaryPOD(input, offsetData_);
-
-        // hierarchy parameters
-        readBinaryPOD(input, dataset_size_);
-        readBinaryPOD(input, num_levels_);
-        readBinaryPOD(input, scaling_);
-        readBinaryPOD(input, mult_);
         readBinaryPOD(input, max_neighbors_);
-        readBinaryPOD(input, ahsp_num_partitions_);
-        readBinaryPOD(input, ahsp_beam_size_);
-        readBinaryPOD(input, ahsp_max_region_size_);
 
-        // get distance metric information
+        // derive the rest of the parameters, as done in constructor
+        dataset_size_ = max_elements_;
+        ahsp_num_partitions_ = 10;
+        ahsp_beam_size_ = 10;
+        ahsp_max_region_size_ = 10000;
+
         data_size_ = s->get_data_size();
         dist_func_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+        size_links_level0_ = max_neighbors_ * sizeof(tableint) + sizeof(linklistsizeint);  // memory for graph
+        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);      // memory for each point
+        offsetData_ = size_links_level0_;
+        label_offset_ = size_links_level0_ + data_size_;
+        offsetLevel0_ = 0;
+        visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements_));
 
         // load memory for bottom level
-        data_level0_memory_ = (char *)malloc(max_elements * size_data_per_element_);
+        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
-
-        // load the hierarchical information
-        hierarchy_.resize(num_levels_ - 1);
-        for (int ell = 0; ell < num_levels_ - 1; ell++) {
-            unsigned int num_pivots;
-            readBinaryPOD(input, num_pivots);
-            hierarchy_[ell].num_pivots_ = (size_t)num_pivots;
-
-            // read the pivots
-            hierarchy_[ell].pivots_.resize(num_pivots);
-            input.read((char *)hierarchy_[ell].pivots_.data(), num_pivots * sizeof(tableint));
-
-            // read the partitions
-            hierarchy_[ell].partitions_.resize(num_pivots);
-            for (size_t itp = 0; itp < num_pivots; itp++) {
-                unsigned int num_members;
-                readBinaryPOD(input, num_members);
-                hierarchy_[ell].partitions_[itp].resize(num_members);
-                input.read((char *)hierarchy_[ell].partitions_[itp].data(), num_members * sizeof(tableint));
-            }
-        }
-
-        size_links_level0_ = max_neighbors_ * sizeof(tableint) + sizeof(linklistsizeint);  // memory for graph
-        visited_list_pool_.reset(new VisitedListPool(1, max_elements));
 
         input.close();
         return;
@@ -400,53 +325,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
      * ====================================================================================================
      */
 
-    // simply adding the data and initializing the bottom layer graph
+    // add each data point and initialize the bottom layer graph
     void addPoint(const void *data_point, labeltype label) {
         if (cur_element_count >= max_elements_) {
             throw std::runtime_error("The number of elements exceeds the specified limit");
         }
-
-        // adding point to the data structure
-        tableint pivot = cur_element_count;
+        tableint const node = cur_element_count;
         cur_element_count++;
-        label_lookup_[label] = pivot;
-
-        // get a random level
-        int level_assignment = getRandomLevel(mult_);
-        if (level_assignment > num_levels_ - 1) level_assignment = num_levels_ - 1;
+        label_lookup_[label] = node;
 
         // - initializing and setting data/graph memory for bottom level
-        memset(data_level0_memory_ + pivot * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
-        memcpy(getExternalLabeLp(pivot), &label, sizeof(labeltype));
-        memcpy(getDataByInternalId(pivot), data_point, data_size_);
-
-        // if belongs to a higher level, add it and initialize data structures
-        for (int l = 1; l <= level_assignment; l++) {
-            int level_of_interest = num_levels_ - l - 1;
-            hierarchy_[level_of_interest].add_pivot(pivot);
-        }
-
+        memset(data_level0_memory_ + node * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
+        memcpy(getExternalLabeLp(node), &label, sizeof(labeltype));
+        memcpy(getDataByInternalId(node), data_point, data_size_);
         return;
     }
 
-    void printHierarchyStats() {
-        printf("Printing hierarchy stats:\n");
-
-        for (int ell = 0; ell < num_levels_ - 1; ell++) {
-            printf(" * level %d: num_pivots = %u\n", ell, hierarchy_[ell].num_pivots_);
-        }
-        printf(" * bottom: %u\n", dataset_size_);
-
-        return;
-    }
 
     /**
      * @brief Index Construction
      *  add num_maps
      *  int M, int ef_construct, int ef_assign
      */
-    void build(int num_partitions = 10) {
+    void build(int scaling = 100, int num_partitions = 10) {
         printf("Begin Index Construction...\n");
+
+        // initilaize the hierarchy for approximate hsp
+        //  - probabilistically select nodes and add to each level
+        initialize_hierarchy(scaling); 
 
         /**
          *
@@ -454,288 +360,253 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
          *
          */
 
-        //> BUILD THE TOP LEVELS FIRST
-        for (int ell = 1; ell < num_levels_ - 1; ell++) {
+        //> Build each level
+        for (int ell = 1; ell < num_levels_; ell++) {
             printf("Begin Level-%d Construction\n", ell);
-            size_t const num_pivots = hierarchy_[ell].num_pivots_;
-            printf(" * num_pivots = %u\n", num_pivots);
-
-            //> Perform the partitioning of this current layer
             tStart = std::chrono::high_resolution_clock::now();
-            tStart1 = std::chrono::high_resolution_clock::now();
+            bool flag_bottom_level = (ell == num_levels_ - 1);
+
+            // - initializations
+            size_t num_pivots = dataset_size_;
+            if (!flag_bottom_level) 
+                num_pivots = hierarchy_[ell].num_pivots_;
+            printf(" * num_pivots = %u\n", num_pivots);
+            hierarchy_[ell-1].initialize_partitions();
             std::vector<tableint> pivot_assignments(num_pivots);
-#pragma omp parallel for
-            for (size_t itp = 0; itp < num_pivots; itp++) {
-                tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
-                char *fine_pivot_ptr = getDataByInternalId(fine_pivot);
-                tableint closest_pivot;
 
-                // - top-down assignment to a coarse pivot
-                for (int c = 0; c < ell; c++) {
-                    // - define the candidate pivots in the layer
-                    std::vector<tableint> candidate_coarse_pivots{};
-                    if (c == 0) {
-                        candidate_coarse_pivots = hierarchy_[c].pivots_;
-                    } else {
-                        candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
-                    }
+            //> Begin Partitioning the Dataset
+            printf(" * begin partitioning of the level\n");
+            tStart1 = std::chrono::high_resolution_clock::now();
+            if (!flag_bottom_level) { // for upper levels
 
-                    // - find and record the closest coarse pivot
-                    dist_t closest_dist = HUGE_VAL;
-                    for (tableint coarse_pivot : candidate_coarse_pivots) {
-                        dist_t const dist =
-                            dist_func_(fine_pivot_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
-                        if (dist < closest_dist) {
-                            closest_dist = dist;
-                            closest_pivot = coarse_pivot;
+                //> Perform the partitioning of this current layer         
+                // - perform this task using all threads
+                // #pragma omp parallel for
+                for (size_t itp = 0; itp < num_pivots; itp++) {
+                    tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
+                    char *fine_pivot_ptr = getDataByInternalId(fine_pivot);
+                    tableint closest_pivot;
+
+                    // - top-down assignment to a coarse pivot
+                    for (int c = 0; c < ell; c++) {
+
+                        // - define the candidate pivots in the layer
+                        std::vector<tableint> candidate_coarse_pivots{};
+                        if (c == 0) {
+                            candidate_coarse_pivots = hierarchy_[c].pivots_;
+                        } else {
+                            candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
+                        }
+
+                        // - find and record the closest coarse pivot
+                        dist_t closest_dist = HUGE_VAL;
+                        for (tableint coarse_pivot : candidate_coarse_pivots) {
+                            dist_t const dist =
+                                dist_func_(fine_pivot_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
+                            if (dist < closest_dist) {
+                                closest_dist = dist;
+                                closest_pivot = coarse_pivot;
+                            }
                         }
                     }
+
+                    // - record the closest coarse pivot found (thread safe)
+                    pivot_assignments[itp] = closest_pivot;
                 }
 
-                // - record the closest coarse pivot found (thread safe)
-                pivot_assignments[itp] = closest_pivot;
-            }
+                // - assign to the partitions (thread safe)
+                for (size_t itp = 0; itp < num_pivots; itp++) {
+                    tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
+                    hierarchy_[ell - 1].add_member(pivot_assignments[itp], fine_pivot);
+                }
+            } else { // for bottom level
 
-            // - assign to the partitions (thread safe)
-            for (size_t itp = 0; itp < num_pivots; itp++) {
-                tableint fine_pivot = hierarchy_[ell].pivots_[itp];
-                hierarchy_[ell - 1].add_member(pivot_assignments[itp], fine_pivot);
+                //> Perform the partitioning of this current layer
+                // #pragma omp parallel for
+                for (tableint node = 0; node < dataset_size_; node++) {
+                    char *node_ptr = getDataByInternalId(node);
+                    tableint closest_pivot;
+
+                    // - top-down assignment to a coarse pivot
+                    for (int c = 0; c < ell; c++) {
+                        // - define the candidate pivots in the layer
+                        std::vector<tableint> candidate_coarse_pivots{};
+                        if (c == 0) {
+                            candidate_coarse_pivots = hierarchy_[c].pivots_;
+                        } else {
+                            candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
+                        }
+
+                        // - find and record the closest coarse pivot
+                        dist_t closest_dist = HUGE_VAL;
+                        for (tableint coarse_pivot : candidate_coarse_pivots) {
+                            dist_t const dist = dist_func_(node_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
+                            if (dist < closest_dist) {
+                                closest_dist = dist;
+                                closest_pivot = coarse_pivot;
+                            }
+                        }
+                    }
+
+                    // - record the closest coarse pivot found (thread safe)
+                    pivot_assignments[node] = closest_pivot;
+                }
+
+                // - assign to the partitions (thread safe)
+                for (tableint node = 0; node < dataset_size_; node++) {
+                    hierarchy_[ell - 1].add_member(pivot_assignments[node], node);
+                }
             }
             tEnd1 = std::chrono::high_resolution_clock::now();
             double time_part = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
             printf(" * partitioning time: %.4f\n", time_part);
 
-            //> Graph Construction
-            // - building graph on every other level (num_levels_ = 7: 0,1,2,3,4,5,6 numbering)
-            // - why not all? better approximate hsp performance by using larger partitions, thus using partitions
-            //   defined by two layers above.
-            //      * if 7 levels (odd number), then construction graph on level 2,4,6
-            //      * if 8 levels (even number), then construct graph on level 1,3,5,7
-            int const num_levels_odd_ = num_levels_ % 2;
-            int const ell_odd = ell % 2;
-            if ((num_levels_odd_ && !ell_odd) || (!num_levels_odd_ && ell_odd)) {
-                printf(" * constructing graph\n");
 
-                //> Construct the Locally Monotonic Graph on the Level
-                tStart1 = std::chrono::high_resolution_clock::now();
-                std::vector<std::vector<tableint>> graph(num_pivots);
-#pragma omp parallel for
+            //> Construct the Locally Monotonic Graph on the Level
+            printf(" * begin construction of locally monotonic graph\n");
+            tStart1 = std::chrono::high_resolution_clock::now();
+            if (!flag_bottom_level) { // for upper levels
+                hierarchy_[ell].initialize_graph();
+
+                // - find the hsp neighbors of each in parallel
+                #pragma omp parallel for
                 for (size_t itp = 0; itp < num_pivots; itp++) {
                     tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
                     char *fine_pivot_ptr = getDataByInternalId(fine_pivot);
 
                     // - define the candidate list of neighbors
                     std::vector<tableint> candidate_fine_pivots{};
-                    if (ell == 1 || ell == 2) {
-                        candidate_fine_pivots = hierarchy_[ell].pivots_;  // using all pivots
+                    if (num_pivots < 20000) {      // brute force 
+                        candidate_fine_pivots = hierarchy_[ell].pivots_;
                     } else {
-                        //> Define the set of pivots by the closest partitions
-                        // - use partitions to find starting node in graph of level ell - 2
-                        tableint start_node;
-                        for (int c = 0; c < ell - 1; c++) {
-                            // - define the candidate pivots in the layer
-                            std::vector<tableint> candidate_coarse_pivots{};
-                            if (c == 0) {
-                                candidate_coarse_pivots = hierarchy_[c].pivots_;
-                            } else {
-                                candidate_coarse_pivots = hierarchy_[c - 1].get_partition(start_node);
-                            }
 
-                            // - find and record the closest coarse pivot
-                            dist_t start_node_distance = HUGE_VAL;
-                            for (tableint coarse_pivot : candidate_coarse_pivots) {
-                                dist_t const dist =
-                                    dist_func_(fine_pivot_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
-                                if (dist < start_node_distance) {
-                                    start_node_distance = dist;
-                                    start_node = coarse_pivot;
-                                }
-                            }
-                        }
+                        //> Define the candidate region by a set of nearby partitions
+                        // - starting from the closest pivot
+                        tableint start_node = pivot_assignments[itp]; 
 
-                        // - perform graph-based search to obtain the closest coarse pivots in level l-2
-                        // - set beam_size with variable
-                        std::vector<tableint> closest_coarse_pivots2 =
-                            beamSearchOnLevel(fine_pivot_ptr, num_partitions, ell - 2, start_node);
+                        // - beam search to collect the b closest pivots (MODIFY)
+                        int ahsp_num_partitions_ = 10;
+                        std::vector<tableint> closest_coarse_pivots = beamSearchConstruction(ell-1, fine_pivot_ptr, ahsp_num_partitions_, start_node);
 
-                        // - collect all the partitions associated with the l-2 coarse pivots
-                        std::vector<tableint> closest_coarse_pivots1{};
-                        for (tableint coarse_pivot2 : closest_coarse_pivots2) {
-                            std::vector<tableint> const &coarse_partition2 =
-                                hierarchy_[ell - 2].get_partition(coarse_pivot2);
-                            closest_coarse_pivots1.insert(closest_coarse_pivots1.end(), coarse_partition2.begin(),
-                                                          coarse_partition2.end());
-                        }
-
-                        // - collect all the partitions associated with the l-1 coarse pivots
-                        for (tableint coarse_pivot1 : closest_coarse_pivots1) {
-                            std::vector<tableint> const &coarse_partition1 =
-                                hierarchy_[ell - 1].get_partition(coarse_pivot1);
-                            candidate_fine_pivots.insert(candidate_fine_pivots.end(), coarse_partition1.begin(),
-                                                         coarse_partition1.end());
+                        // - collect partitions associated with the closest coarse pivots
+                        for (tableint coarse_pivot : closest_coarse_pivots) {
+                            std::vector<tableint> const &coarse_partition = hierarchy_[ell - 1].get_partition(coarse_pivot);
+                            candidate_fine_pivots.insert(candidate_fine_pivots.end(), coarse_partition.begin(), coarse_partition.end());
                         }
                     }
 
                     // - Perform the HSP test on this neighborhood
-                    int max_region_size = 10000;
-                    int max_neighbors = 128;
-                    std::vector<uint> fine_pivot_neighbors = hsp_test(fine_pivot, candidate_fine_pivots);
-                    hierarchy_[ell].set_neighbors(fine_pivot, fine_pivot_neighbors);
+                    // - modify: max region size
+                    std::vector<uint> neighbors = hsp_test(fine_pivot, candidate_fine_pivots);
+                    hierarchy_[ell].set_neighbors(fine_pivot, neighbors);
                 }
 
-                // - assign neighbors to the graph (thread safe)
+                // get ave. degree
                 double ave_degree = 0.0f;
                 for (size_t itp = 0; itp < num_pivots; itp++) {
                     uint fine_pivot = hierarchy_[ell].pivots_[itp];
-                    ave_degree += (double)hierarchy_[ell].get_neighbors(fine_pivot).size();
+                    ave_degree += (double) hierarchy_[ell].get_neighbors(fine_pivot).size();
                 }
-                ave_degree /= (double)num_pivots;
-                tEnd1 = std::chrono::high_resolution_clock::now();
-                double time_graph = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
-                printf(" * graph time: %.4f\n", time_graph);
+                ave_degree /= (double) num_pivots;
                 printf(" * ave degree: %.2f\n", ave_degree);
-            } else {
-                printf(" * skipping graph\n");
+
+            } else { // bottom level graph
+
+                //> Construct the Locally Monotonic Graph on the bottom level
+                #pragma omp parallel for
+                for (tableint node = 0; node < dataset_size_; node++) {
+                    char *node_ptr = getDataByInternalId(node);
+
+                    //> Define the candidate region by a set of nearby partitions
+                    // - starting from the closest pivot
+                    tableint start_node = pivot_assignments[node]; 
+
+                    // - beam search to collect the b closest pivots (MODIFY)
+                    int ahsp_num_partitions_ = 10;
+                    std::vector<tableint> closest_pivots = beamSearchConstruction(ell-1, node_ptr, ahsp_num_partitions_, start_node);
+
+                    // - collect partitions associated with the closest coarse pivots
+                    std::vector<tableint> candidate_nodes{};
+                    for (tableint pivot : closest_pivots) {
+                        std::vector<tableint> const &pivot_partition = hierarchy_[ell-1].get_partition(pivot);
+                        candidate_nodes.insert(candidate_nodes.end(), pivot_partition.begin(),
+                                                        pivot_partition.end());
+                    }
+
+                    // - Perform the HSP test on this neighborhood
+                    // - modify: max region size
+                    std::vector<uint> neighbors = hsp_test(node, candidate_nodes);
+
+                    // set the neighbors on the bottom level
+                    linklistsizeint *ll_node = get_linklist0(node);  // get start of list (num_neighbors, n1, n2, n3,...)
+                    setListCount(ll_node, neighbors.size());    // set the new number of neighbors
+                    tableint *neighbors_data = (tableint *)(ll_node + 1);  // pointer to first neighbor
+                    for (size_t n = 0; n < neighbors.size(); n++) {
+                        neighbors_data[n] = neighbors[n];
+                    }
+                }
+
+                // - get the average degree
+                double ave_degree = 0.0f;
+                for (tableint node = 0; node < dataset_size_; node++) {
+                    linklistsizeint *data = (linklistsizeint *)get_linklist0(node);
+                    ave_degree += (double)getListCount((linklistsizeint *)data);
+                }
+                ave_degree /= (double)dataset_size_;
+                printf(" * ave degree: %.2f\n", ave_degree);
             }
+            tEnd1 = std::chrono::high_resolution_clock::now();
+            double time_graph = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
+            printf(" * graph time: %.4f\n", time_graph);
+
             tEnd = std::chrono::high_resolution_clock::now();
             double time_level = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd - tStart).count();
             printf(" * total level construction time: %.4f\n", time_level);
         }
+        return;
+    }
 
-        //> BUILD THE BOTTOM LEVEL NOW
-        {
-            int ell = num_levels_ - 1;
-            printf("Begin Level-%d Construction (bottom level)\n", ell);
-            printf(" * dataset_size_ = %u\n", dataset_size_);
+    /**
+     * @brief Initialize the hierarchy
+     * 
+     * @param scaling 
+     */
+    void initialize_hierarchy(int const scaling) {
+        hierarchy_.clear();
 
-            //> Perform the partitioning of this current layer
-            tStart = std::chrono::high_resolution_clock::now();
-            tStart1 = std::chrono::high_resolution_clock::now();
-            std::vector<tableint> pivot_assignments(dataset_size_);
-#pragma omp parallel for
-            for (tableint node = 0; node < dataset_size_; node++) {
-                char *node_ptr = getDataByInternalId(node);
-                tableint closest_pivot;
-
-                // - top-down assignment to a coarse pivot
-                for (int c = 0; c < ell; c++) {
-                    // - define the candidate pivots in the layer
-                    std::vector<tableint> candidate_coarse_pivots{};
-                    if (c == 0) {
-                        candidate_coarse_pivots = hierarchy_[c].pivots_;
-                    } else {
-                        candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
-                    }
-
-                    // - find and record the closest coarse pivot
-                    dist_t closest_dist = HUGE_VAL;
-                    for (tableint coarse_pivot : candidate_coarse_pivots) {
-                        dist_t const dist = dist_func_(node_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
-                        if (dist < closest_dist) {
-                            closest_dist = dist;
-                            closest_pivot = coarse_pivot;
-                        }
-                    }
-                }
-
-                // - record the closest coarse pivot found (thread safe)
-                pivot_assignments[node] = closest_pivot;
-            }
-
-            // - assign to the partitions (thread safe)
-            for (tableint node = 0; node < dataset_size_; node++) {
-                hierarchy_[ell - 1].add_member(pivot_assignments[node], node);
-            }
-            tEnd1 = std::chrono::high_resolution_clock::now();
-            double time_part = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
-            printf(" * partitioning time: %.4f\n", time_part);
-
-            //> Construct the Locally Monotonic Graph on the bottom level
-            printf(" * constructing graph\n");
-            tStart1 = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for
-            for (tableint node = 0; node < dataset_size_; node++) {
-                char *node_ptr = getDataByInternalId(node);
-
-                // - define the candidate list of neighbors
-                if (ell <= 2) {
-                    throw std::runtime_error("Only 2 or 3 layers... expecting more");
-                }
-
-                //> Define the set of pivots by the closest partitions
-                // - use partitions to find starting node in graph of level ell - 2
-                tableint start_node;
-                for (int c = 0; c < ell - 1; c++) {
-                    // - define the candidate pivots in the layer
-                    std::vector<tableint> candidate_coarse_pivots{};
-                    if (c == 0) {
-                        candidate_coarse_pivots = hierarchy_[c].pivots_;
-                    } else {
-                        candidate_coarse_pivots = hierarchy_[c - 1].get_partition(start_node);
-                    }
-
-                    // - find and record the closest coarse pivot
-                    dist_t start_node_distance = HUGE_VAL;
-                    for (tableint coarse_pivot : candidate_coarse_pivots) {
-                        dist_t const dist = dist_func_(node_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
-                        if (dist < start_node_distance) {
-                            start_node_distance = dist;
-                            start_node = coarse_pivot;
-                        }
-                    }
-                }
-
-                // - perform graph-based search to obtain the closest coarse pivots in level l-2
-                std::vector<tableint> closest_coarse_pivots2 =
-                    beamSearchOnLevel(node_ptr, num_partitions, ell - 2, start_node);
-
-                // - collect all the partitions associated with the l-2 coarse pivots
-                std::vector<tableint> closest_coarse_pivots1{};
-                for (tableint coarse_pivot2 : closest_coarse_pivots2) {
-                    std::vector<tableint> const &coarse_partition2 = hierarchy_[ell - 2].get_partition(coarse_pivot2);
-                    closest_coarse_pivots1.insert(closest_coarse_pivots1.end(), coarse_partition2.begin(),
-                                                  coarse_partition2.end());
-                }
-
-                // - collect all the partitions associated with the l-1 coarse pivots
-                std::vector<tableint> candidate_nodes{};
-                for (tableint coarse_pivot1 : closest_coarse_pivots1) {
-                    std::vector<tableint> const &coarse_partition1 = hierarchy_[ell - 1].get_partition(coarse_pivot1);
-                    candidate_nodes.insert(candidate_nodes.end(), coarse_partition1.begin(), coarse_partition1.end());
-                }
-
-                // - Perform the HSP test on this neighborhood
-                int max_region_size = 10000;
-                int max_neighbors = 128;
-                std::vector<uint> node_neighbors = hsp_test(node, candidate_nodes);
-
-                // set the neighbors of this bottom layer node
-                linklistsizeint *ll_node = get_linklist0(node);  // get start of list (num_neighbors, n1, n2, n3,...)
-                setListCount(ll_node, node_neighbors.size());    // set the new number of neighbors
-                tableint *node_neighbors_data =
-                    (tableint *)(ll_node + 1);  // get the pointer to beginning of the neighbors
-                for (size_t n = 0; n < node_neighbors.size(); n++) {
-                    tableint const neighbor = node_neighbors[n];
-                    node_neighbors_data[n] = neighbor;
-                }
-            }
-
-            // - assign neighbors to the graph (thread safe)
-            double ave_degree = 0.0f;
-            for (tableint node = 0; node < dataset_size_; node++) {
-                linklistsizeint *data = (linklistsizeint *)get_linklist0(node);
-                ave_degree += (double)getListCount((linklistsizeint *)data);
-            }
-            ave_degree /= (double)dataset_size_;
-            tEnd1 = std::chrono::high_resolution_clock::now();
-            double time_graph = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
-            printf(" * graph time: %.4f\n", time_graph);
-            printf(" * ave degree: %.2f\n", ave_degree);
+        // estimate the number of levels
+        num_levels_ = 0;
+        double start_value = (double) dataset_size_;
+        while (start_value >= 10) {
+            num_levels_++;
+            start_value /= (double) scaling;
         }
+        hierarchy_.resize(num_levels_ - 1);
+        printf(" * number of levels: %d\n", num_levels_);
+
+        // select pivots probabilistically on each level, same as hnsw
+        mult_ = 1 / log( (double) scaling); 
+        std::default_random_engine level_generator;
+        level_generator.seed(3); 
+        for (tableint index = 0; index < dataset_size_; index++) {
+            int level_assignment = getRandomLevel(mult_);
+            if (level_assignment > num_levels_ - 1) level_assignment = num_levels_ - 1;
+
+            // add to each level
+            // want top to be level 0, bottom to be level num_levels_-1
+            for (int l = 1; l <= level_assignment; l++) {
+                int level_of_interest = num_levels_ - l - 1;
+                hierarchy_[level_of_interest].add_pivot(index);
+            }
+        }
+        for (int l = 0; l < hierarchy_.size(); l++) {
+            printf(" * %d --> %u\n", l, (uint) hierarchy_[l].num_pivots_);
+        }
+        return;
     }
 
     // performing a beam search to obtain the closest partitions for approximate hsp
-    std::vector<tableint> beamSearchOnLevel(const void *query_ptr, int k, int level, tableint start_node) {
+    std::vector<tableint> beamSearchConstruction(int level, const void *query_ptr, int k, tableint start_node) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -788,7 +659,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         visited_list_pool_->releaseVisitedList(vl);
 
-        // now update the
+        // return simply the neighbors
         std::vector<tableint> neighbors(k);
         while (top_candidates.size() > k) top_candidates.pop();
         for (int i = k - 1; i >= 0; i--) {
@@ -799,7 +670,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     // perform the hsp test to get the hsp neighbors of the node
-    std::vector<tableint> hsp_test(tableint const query_node, std::vector<tableint> const &set) {
+    std::vector<tableint> hsp_test(tableint const query_node, std::vector<tableint> const &set, int max_k = 0) {
         std::vector<tableint> neighbors{};
         char *query_ptr = getDataByInternalId(query_node);
 
@@ -820,8 +691,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             active_list.emplace_back(distance, index);
         }
 
-        // can trim the test here if desired
-        // nth_select()
+        // - limit the number of points to consider
+        if (max_k > 0 && active_list.size() > max_k) {
+            // - nth_element sort: bring the kth closest elements to the front, but not sorted, O(N)
+            std::nth_element(active_list.begin(), active_list.begin()+ max_k, active_list.end());
+            active_list.resize(max_k); // keep only the top k points
+        }
 
         // - perform the hsp loop witin some maximum number of neighbors/iterations
         for (size_t n = 0; n < max_neighbors_; n++) {
@@ -866,5 +741,137 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         return neighbors;
     }
+
+    void print_ave_degree() {
+        if (cur_element_count <= 0) return;
+
+        // - get the average degree
+        double ave_degree = 0.0f;
+        for (tableint node = 0; node < dataset_size_; node++) {
+            linklistsizeint *data = (linklistsizeint *)get_linklist0(node);
+            ave_degree += (double)getListCount((linklistsizeint *)data);
+        }
+        ave_degree /= (double) dataset_size_;
+        printf("ave_degree = %.2f\n", ave_degree);
+        return;
+    }
+
+    // void createHierarchicalPartitioning(int scaling) {
+
+    //     // initilaize the hierarchy for approximate hsp
+    //     //  - probabilistically select nodes and add to each level
+    //     initialize_hierarchy(scaling); 
+
+    //     /**
+    //      *
+    //      *     TOP-DOWN CONSTRUCTION OF THE GRAPH HIERARCHY
+    //      *
+    //      */
+
+    //     //> Build each level
+    //     for (int ell = 1; ell < num_levels_; ell++) {
+    //         printf("Begin Level-%d Construction\n", ell);
+    //         tStart = std::chrono::high_resolution_clock::now();
+    //         bool flag_bottom_level = (ell == num_levels_ - 1);
+
+    //         // - initializations
+    //         size_t num_pivots = dataset_size_;
+    //         if (!flag_bottom_level) 
+    //             num_pivots = hierarchy_[ell].num_pivots_;
+    //         printf(" * num_pivots = %u\n", num_pivots);
+    //         hierarchy_[ell-1].initialize_partitions();
+    //         std::vector<tableint> pivot_assignments(num_pivots);
+
+
+
+    //     //> Begin Partitioning the Dataset
+    //     printf(" * begin partitioning of the level\n");
+    //     tStart1 = std::chrono::high_resolution_clock::now();
+    //     if (!flag_bottom_level) { // for upper levels
+
+    //         //> Perform the partitioning of this current layer         
+    //         // - perform this task using all threads
+    //         // #pragma omp parallel for
+    //         for (size_t itp = 0; itp < num_pivots; itp++) {
+    //             tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
+    //             char *fine_pivot_ptr = getDataByInternalId(fine_pivot);
+    //             tableint closest_pivot;
+
+    //             // - top-down assignment to a coarse pivot
+    //             for (int c = 0; c < ell; c++) {
+
+    //                 // - define the candidate pivots in the layer
+    //                 std::vector<tableint> candidate_coarse_pivots{};
+    //                 if (c == 0) {
+    //                     candidate_coarse_pivots = hierarchy_[c].pivots_;
+    //                 } else {
+    //                     candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
+    //                 }
+
+    //                 // - find and record the closest coarse pivot
+    //                 dist_t closest_dist = HUGE_VAL;
+    //                 for (tableint coarse_pivot : candidate_coarse_pivots) {
+    //                     dist_t const dist =
+    //                         dist_func_(fine_pivot_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
+    //                     if (dist < closest_dist) {
+    //                         closest_dist = dist;
+    //                         closest_pivot = coarse_pivot;
+    //                     }
+    //                 }
+    //             }
+
+    //             // - record the closest coarse pivot found (thread safe)
+    //             pivot_assignments[itp] = closest_pivot;
+    //         }
+
+    //         // - assign to the partitions (thread safe)
+    //         for (size_t itp = 0; itp < num_pivots; itp++) {
+    //             tableint const fine_pivot = hierarchy_[ell].pivots_[itp];
+    //             hierarchy_[ell - 1].add_member(pivot_assignments[itp], fine_pivot);
+    //         }
+    //     } else { // for bottom level
+
+    //         //> Perform the partitioning of this current layer
+    //         // #pragma omp parallel for
+    //         for (tableint node = 0; node < dataset_size_; node++) {
+    //             char *node_ptr = getDataByInternalId(node);
+    //             tableint closest_pivot;
+
+    //             // - top-down assignment to a coarse pivot
+    //             for (int c = 0; c < ell; c++) {
+    //                 // - define the candidate pivots in the layer
+    //                 std::vector<tableint> candidate_coarse_pivots{};
+    //                 if (c == 0) {
+    //                     candidate_coarse_pivots = hierarchy_[c].pivots_;
+    //                 } else {
+    //                     candidate_coarse_pivots = hierarchy_[c - 1].get_partition(closest_pivot);
+    //                 }
+
+    //                 // - find and record the closest coarse pivot
+    //                 dist_t closest_dist = HUGE_VAL;
+    //                 for (tableint coarse_pivot : candidate_coarse_pivots) {
+    //                     dist_t const dist = dist_func_(node_ptr, getDataByInternalId(coarse_pivot), dist_func_param_);
+    //                     if (dist < closest_dist) {
+    //                         closest_dist = dist;
+    //                         closest_pivot = coarse_pivot;
+    //                     }
+    //                 }
+    //             }
+
+    //             // - record the closest coarse pivot found (thread safe)
+    //             pivot_assignments[node] = closest_pivot;
+    //         }
+
+    //         // - assign to the partitions (thread safe)
+    //         for (tableint node = 0; node < dataset_size_; node++) {
+    //             hierarchy_[ell - 1].add_member(pivot_assignments[node], node);
+    //         }
+    //     }
+    //     tEnd1 = std::chrono::high_resolution_clock::now();
+    //     double time_part = std::chrono::duration_cast<std::chrono::duration<double>>(tEnd1 - tStart1).count();
+    //     printf(" * partitioning time: %.4f\n", time_part);
+    //     return;
+    // }
+
 };
 }  // namespace hnswlib
