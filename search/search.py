@@ -107,7 +107,7 @@ def run(size):
         # save the results
         labels = labels + 1 # FAISS is 0-indexed, groundtruth is 1-indexed
         identifier = f"index=({index_identifier}),query=(b={beam_size})"
-        store_results(os.path.join("results/", kind, size, f"{identifier}.h5"), index_identifier, kind, distances, labels, build_time, search_time, identifier, size)
+        store_results(os.path.join("result/", kind, size, f"{identifier}.h5"), index_identifier, kind, distances, labels, build_time, search_time, identifier, size)
     
 
 
