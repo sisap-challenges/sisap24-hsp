@@ -5,7 +5,7 @@ import csv
 from pathlib import Path
 from urllib.request import urlretrieve
 
-data_directory = "/users/cfoste18/scratch/datasets/LAION"
+data_directory = "data"
 
 def download(src, dst):
     if not os.path.exists(dst):
