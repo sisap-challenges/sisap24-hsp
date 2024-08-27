@@ -1,0 +1,12 @@
+
+## construction
+
+docker build -t sisap24/hsp . -t "sisap24-hsp"
+
+## search
+
+docker run --cpus=54 -v /home/sisap23evaluation/data2024:/data:ro -v ./result:/result -it sisap24/hsp
+
+conda activate hsp
+
+python3 search/search.py --size 100M

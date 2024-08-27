@@ -52,7 +52,7 @@ def run(size):
     index_identifier = f"HSP"
     
     #> Download dataset if necessary
-    prepare(kind, size)
+    #prepare(kind, size)
     D=768
 
     #> Index parameters
@@ -65,7 +65,10 @@ def run(size):
 
     #> Load the dataset
     start_time = time.time()
-    with h5py.File(os.path.join(data_directory, kind, size, "dataset.h5"), 'r') as f:
+    datafile = f"data/laion2B-en-{kind}-n={size}.h5"
+    queriesfile = f"data/private-queries-2024-laion2B-en-{kind}-n=10k-epsilon=0.2.h5"
+
+    with h5py.File(datafile, 'r') as f:
         dataset = f[key]
         N,DD = dataset.shape
         print(f'Datset has N={N} rows and D={DD} columns')
@@ -93,7 +96,7 @@ def run(size):
     print(f"Done Constructing Index in {build_time:.4f} (s)")
 
     # get the queries
-    queries = np.array(h5py.File(os.path.join(data_directory, kind, size, "query.h5"), "r")[key],dtype=np.float32)
+    queries = np.array(h5py.File(queriesfile, "r")[key],dtype=np.float32)
 
     #> Searching on the index
     for beam_size in beam_size_vec:
